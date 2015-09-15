@@ -1,0 +1,759 @@
+
+var PROJECT='AspNet'
+var VERSION='0.2.1'
+
+use-teamcity
+use namespace='System'
+use namespace='System.IO'
+use namespace='System.Collections.Generic'
+use namespace='System.Net'
+use namespace='System.Linq'
+use namespace='System.Text'
+use namespace='System.Text.RegularExpressions'
+use namespace='System.Threading.Tasks'
+use import="BuildEnv"
+
+functions
+    @{
+        static string BUILD_BRANCH = Environment.GetEnvironmentVariable("BUILD_BRANCH") ?? "dev";
+        static string BASE_DIR = Directory.GetCurrentDirectory();
+        static string TARGET_DIR = Path.Combine(BASE_DIR, "artifacts", "build");
+        static bool SKIP_NO_CREDENTIALS = Environment.GetEnvironmentVariable("UNIVERSE_SKIP_NO_CREDENTIALS") == "1";
+
+        // Doesn't build on Mono since their contracts don't match
+        string[] excludeReposOnMono = new[] { "Helios" };
+        IEnumerable<string> repositories = GetRepositoriesToBuild();
+
+        static bool useHttps = UseHttps(BASE_DIR);
+        static string gitHubUriPrefix = useHttps ? "https://github.com/aspnet/" : "git@github.com:aspnet/";
+    }
+
+var buildTarget = "compile"
+
+@{
+    var kBuildVersion = Environment.GetEnvironmentVariable("DNX_BUILD_VERSION");
+    if (!string.IsNullOrEmpty(kBuildVersion))
+    {
+        VERSION += "-" + kBuildVersion;
+    }
+    else
+    {
+        VERSION += "-" + BuildNumber;
+    }
+}
+
+#default .compile
+
+#pull
+#compile .pull
+#install .pull
+
+#pack
+    directory create='${TARGET_DIR}'
+    nuget-pack nuspecFile='${Path.Combine(BASE_DIR, "KoreBuild.nuspec")}' packageVersion='${VERSION}' outputDir='${TARGET_DIR}'
+
+#pack-install .pack
+    nuget-local-publish sourcePackagesDir='${TARGET_DIR}'
+
+#git-pull target='pull'
+    @{
+        Parallel.ForEach(repositories, repo =>
+        {
+            CloneOrUpdate(repo);
+        });
+    }
+
+#verify-all .pull .change-default-build-target .only-compile
+
+#smoke-test-mono .pull .fix-project-json .change-default-build-target .only-compile
+
+#fix-project-json
+    @{
+        repositories = repositories.Except(excludeReposOnMono).ToArray();
+    }
+    -// Fix project.json to remove .Net portable references
+    for each='var repo in repositories'
+        for each='var file in Files.Include(repo + "/**"  +  "/project.json")'
+            update-file updateFile='${file}'
+              @{
+                  updateText = updateText.Replace(".NETPortable,Version=4.6,Profile=Profile151", "foo");
+                  updateText = updateText.Replace(".NETPortable,Version=v4.6,Profile=Profile151", "foo");
+              }
+
+#change-default-build-target
+    @{
+        buildTarget = "verify";
+    }
+
+#init
+    @{
+        var templatePath = Path.Combine(BASE_DIR, "build-template");
+        var templateFiles = Files.Include(templatePath + Path.DirectorySeparatorChar + "*.*").Select(Path.GetFileName).ToList();
+
+        foreach(var repo in repositories)
+        {
+            foreach (string fileName in templateFiles)
+            {
+                var targetFile = Path.Combine(Directory.GetCurrentDirectory(), repo, fileName);
+                var sourceFile = Path.Combine(Directory.GetCurrentDirectory(), templatePath, fileName);
+
+                // Don't update the makefile
+                if (fileName.Equals("makefile.shade", StringComparison.OrdinalIgnoreCase) && File.Exists(targetFile))
+                {
+                    continue;
+                }
+
+                // Don't update extra configuration files
+                if (fileName.Equals("NuGet.master.config", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Equals("NuGet.release.config", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (!File.Exists(targetFile) ||
+                    (File.ReadAllText(sourceFile) != File.ReadAllText(targetFile)))
+                {
+                    Log.Info("Updating " + fileName + " to " + repo);
+                    File.Copy(sourceFile, targetFile, true);
+                }
+            }
+        }
+    }
+
+#update-release
+    -// Merge dev branch to release
+    @{
+        Parallel.ForEach(GetAllRepos(), CloneOrUpdate);
+
+        Log.Info("************************************* Checking repos for diffs *************************");
+
+        foreach (var repo in GetAllRepos())
+        {
+            Log.Info("Checking repo: " + repo);
+            // Check if the repo previously had a release branch
+            try
+            {
+                GitCommand(repo, "rev-parse --verify --quiet origin/release");
+            }
+            catch
+            {
+                Log.Info("Repository " + repo + " does not have a release branch.");
+                continue;
+            }
+
+            try
+            {
+                GitCommand(repo, "log -1 --exit-code origin/dev..origin/release");
+            }
+            catch
+            {
+                Log.Warn("Unmerged changes in repository " + repo);
+                GitCommand(repo, "log origin/dev..origin/release");
+                throw;
+            }
+        }
+
+        Log.Info("No conflicts in repos, continuing with creating release branch.");
+
+        foreach (var repo in GetAllRepos())
+        {
+            GitCommand(repo, "checkout origin/dev -B release");
+
+            // Update NuGet.Config
+            var nugetConfigPath = Path.Combine(repo, "NuGet.config");
+            if (File.Exists(nugetConfigPath))
+            {
+                var original = File.ReadAllText(nugetConfigPath);
+                var modified = original
+                    .Replace("https://www.myget.org/F/aspnetlitedev", "https://www.myget.org/F/aspnetliterelease")
+                    .Replace("https://www.myget.org/F/azureadwebstacknightly", "https://www.myget.org/F/azureadwebstackrelease");
+
+                if (!string.Equals(original, modified, StringComparison.Ordinal))
+                {
+                    File.WriteAllText(nugetConfigPath, modified);
+                    GitCommand(repo, "add NuGet.Config");
+                    GitCommand(repo, "commit -m \"Updating to release NuGet.config.\"");
+                }
+            }
+
+            GitCommand(repo, "push origin release:release");
+            GitCommand(repo, "checkout origin/dev -B dev");
+            GitCommand(repo, "merge release -s ours");
+            GitCommand(repo, "push origin dev:dev");
+        }
+    }
+
+#pull-all
+    -Parallel.ForEach(GetAllRepos(), CloneOrUpdate);
+
+#update-master
+    -// Merge release branch to master
+    @{
+        foreach (var repo in GetAllRepos())
+        {
+            CloneOrUpdate(repo);
+
+            GitCommand(repo, "checkout origin/release -B master");
+
+            if(File.Exists(Path.Combine(repo, "NuGet.config")))
+            {
+                File.Copy(Path.Combine("build-template", "NuGet.master.config"),
+                      Path.Combine(repo, "NuGet.config"),
+                      overwrite: true);
+                GitCommand(repo, "commit -am \"Updating NuGet.config\"");
+            }
+
+            GitCommand(repo, "push origin master:master -f");
+        }
+    }
+
+#pin-version
+    -// Pin versions of packages in project.json and updated project.lock.json
+    -// More information https://github.com/aspnet/Universe/wiki/%23pin-version-:-Pinning-package-version-for-a-particular-release-in-project.json
+    @{
+        var coherenceFeed = Environment.GetEnvironmentVariable("COHERENCE_FEED");
+        if (string.IsNullOrEmpty(coherenceFeed))
+        {
+            throw new Exception("COHERENCE_FEED not specified. Usually this is Packages-NoTimestamp directory of Coherence-Signed.");
+        }
+
+        var korebuildVersion = Environment.GetEnvironmentVariable("KOREBUILD_VERSION");
+        if (string.IsNullOrEmpty(korebuildVersion))
+        {
+            throw new Exception("KOREBUILD_VERSION environment variable is not specified.");
+        }
+
+        var excludeReposForJson = new[]
+        {
+          "Coherence",
+          "Coherence-Signed",
+          "dnvm",
+          "Entropy"
+        };
+
+        var repos = GetAllRepos().Except(excludeReposForJson);
+        Parallel.ForEach(repos, CloneOrUpdate);
+
+        foreach (var repo in repos)
+        {
+            GitCommand(repo, "checkout master");
+
+            if (File.Exists(Path.Combine(repo, "build.cmd")))
+            {
+                File.Copy(Path.Combine("build-template", "build.cmd"),
+                      Path.Combine(repo, "build.cmd"),
+                      overwrite: true);
+            }
+
+            var repoPath = Path.Combine(Directory.GetCurrentDirectory(), repo);
+
+            Exec("dnx", string.Format(@".\tools\PinVersion run ""{0}"" ""{1}"" ""{2}""", repo, coherenceFeed, korebuildVersion), string.Empty);
+
+            // Build projects to produce project.lock.json
+            Exec("build.cmd", "compile", repo);
+
+            // Replace lock=true in project.lock.json
+            foreach(var file in Directory.GetFiles(repo, "project.lock.json", SearchOption.AllDirectories))
+            {
+                var contents = File.ReadAllText(file);
+                var newContents = contents.Replace("\"locked\": false", "\"locked\": true");
+                File.WriteAllText(file, newContents);
+            }
+
+            // Add the project.json and project.lock.json files
+            foreach(var file in Directory.GetFiles(repo, "project*", SearchOption.AllDirectories))
+            {
+                var gitFilePath = file.Substring(file.IndexOf(repo) + repo.Length + 1);
+
+                // Check if this needs to be included
+                if(ShouldIncludeProjectJson(gitFilePath))
+                {
+                    GitCommand(repo, string.Format("add -f {0}", gitFilePath));
+                }
+            }
+
+            GitCommand(repo, "commit -am \"Updating json files to pin versions and build.cmd to pin KoreBuild and DNX\"");
+
+            GitCommand(repo, "push origin master:master -f");
+        }
+    }
+
+#update-prerelease-tags
+    -// Update tags on each repo to have the latest release tag
+    @{
+        var newPreRelease = Environment.GetEnvironmentVariable("PRERELEASETAG");
+        if(string.IsNullOrEmpty(newPreRelease))
+        {
+            Log.Warn("No prerelease tag defined");
+            return;
+        }
+
+        var versionFile = "version.txt";
+
+        foreach (var repo in GetAllRepos())
+        {
+            CloneOrUpdate(repo);
+
+            GitCommand(repo, "checkout master");
+
+            GitCommand(repo, "pull --tags");
+
+            try
+            {
+                GitCommand(repo, string.Format("describe --tags > ..\\{0}", versionFile));
+            }
+            catch(Exception e)
+            {
+                Log.Warn(string.Format("{0} repo not tagged. Skipping....", repo));
+                continue;
+            }
+
+            var version = File.ReadAllText(versionFile);
+            File.Delete(versionFile);
+
+            Log.Info(string.Format("Current version on repo {0} is {1}", repo, version));
+
+            var majorVersion = version.Split(new string[]{"-"}, StringSplitOptions.None)[0];
+
+            var newVersion = majorVersion + string.Format("-{0}", newPreRelease);
+
+            Log.Info(string.Format("New version for repo is {0}", newVersion));
+
+            GitCommand(repo, string.Format("tag -f -a {0} -m \"Tag for new release {0}\"", newVersion));
+
+            GitCommand(repo, "push -f --tags ");
+        }
+    }
+
+#only-compile target='compile'
+    @{
+        var failed = new Dictionary<string, Exception>();
+        var skipped = new List<string>();
+
+        foreach(var repo in repositories)
+        {
+            var blockName = string.Format("Building {0}", repo);
+            if (IsTeamCity)
+            {
+                Log.Info(string.Format("##teamcity[blockOpened name='{0}']", FormatForTeamCity(blockName)));
+            }
+            try
+            {
+                Log.Info(blockName);
+
+                if (SKIP_NO_CREDENTIALS)
+                {
+                    if (!Directory.Exists(repo))
+                    {
+                        // The directory was not cloned because the credentials were not specified so don't try to build it
+                        skipped.Add(repo);
+                        Log.Warn(string.Format("The repo {0} does not exist locally and it will not be built.", repo));
+                        continue;
+                    }
+                }
+
+                if (IsMono)
+                {
+                    Exec("build.sh", buildTarget, repo);
+                }
+                else
+                {
+                    Exec("build.cmd", buildTarget, repo);
+                }
+
+                Log.Info(string.Format("Build {0} succeeded", repo));
+            }
+            catch(Exception ex)
+            {
+                Log.Warn(string.Format("Build {0} failed: {1}", repo, ex.Message));
+                failed[repo] = ex;
+            }
+            finally
+            {
+                if (IsTeamCity)
+                {
+                    Log.Info(string.Format("##teamcity[blockClosed name='{0}']", FormatForTeamCity(blockName)));
+                }
+            }
+        }
+
+        foreach(var repo in repositories)
+        {
+            Exception ex;
+            if (failed.TryGetValue(repo, out ex))
+            {
+                Log.Warn(string.Format("Build {0} failed: {1}", repo, ex.Message));
+                if (IsTeamCity)
+                {
+                    Log.Warn(string.Format("##teamcity[message text='{0}' errorDetails='{1}' status='ERROR']",
+                                           FormatForTeamCity(ex.Message),
+                                           FormatForTeamCity(ex.StackTrace)));
+                }
+
+            }
+            else if (skipped.Contains(repo))
+            {
+                Log.Warn(string.Format("Build {0} skipped", repo));
+            }
+            else
+            {
+                Log.Info(string.Format("Build {0} succeeded", repo));
+            }
+        }
+
+        if (failed.Any())
+        {
+            throw new Exception("One or more repos failed to build");
+        }
+    }
+
+#only-install target='install'
+    @{
+        foreach(var repo in repositories)
+        {
+            if (IsMono)
+            {
+                Exec("build.sh", "install", repo);
+            }
+            else
+            {
+                Exec("build.cmd", "install", repo);
+            }
+        }
+    }
+
+#run-snapshot-manager
+    @{
+        Exec(@".nuget\nuget.exe", @"restore -out packages tools\TCDependencyManager\packages.config", "");
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        var msbuildPath = Path.Combine(programFiles, "MSBuild", "12.0", "Bin", "MsBuild.exe");
+        Exec(msbuildPath, "TCDependencyManager.csproj", @"tools\TCDependencyManager");
+        Exec(@"tools\TCDependencyManager\bin\Debug\TCDependencyManager.exe", "", "");
+    }
+
+#git-status description='Show status of repos known by Universe'
+    @{
+        foreach(var repo in repositories)
+        {
+            GitStatus(repo);
+        }
+    }
+
+#git-clean description='REMOVE ALL CHANGES to the working directory'
+    @{
+        Console.WriteLine("This runs `git clean -xfd` in all non-Universe repos.");
+        Console.WriteLine("This should REMOVE ALL CHANGES to the working directory.");
+        Console.Write("***** Are you sure? ***** (Y or anything else)? ");
+        if (Console.ReadLine() != "Y")
+        {
+            throw new Exception("git-clean cancelled");
+        }
+        foreach(var repo in repositories)
+        {
+            GitClean(repo);
+        }
+    }
+
+
+macro name='GitPull' gitUri='string' gitBranch='string' gitFolder='string'
+    git-pull
+
+macro name='GitClone' gitUri='string' gitBranch='string'
+    git-clone
+
+macro name='GitConfig' gitOptionName='string' gitOptionValue='string' gitFolder='string'
+    git-config
+
+macro name='GitStatus' gitFolder='string'
+    git gitCommand='status'
+
+macro name='GitClean' gitFolder='string'
+    git gitCommand='clean -xdf'
+
+macro name='GitCommand' gitFolder='string' gitCommand='string'
+    git
+
+macro name='Exec' program='string' commandline='string' workingdir='string'
+    exec
+
+functions
+    @{
+        static bool UseHttps(string directory)
+        {
+            var filename = Path.Combine(directory, ".git", "config");
+            if (!File.Exists(filename))
+            {
+                Console.WriteLine("Unable to find '{0}' file", filename);
+                return false;
+            }
+
+            var url = ReadOriginUrl(filename);
+            return IsHttpsUrl(url);
+        }
+
+        // Perform equivalent of `git config remote.origin.url` but directly
+        // read config file to get value.
+        static string ReadOriginUrl(string filename)
+        {
+            // Subsection portion of configuration name is case-sensitive; rest
+            // of name is case-insensitive.
+            var beginOriginSection = new Regex(@"^\[(?i:remote) ""origin""\]\s*$");
+            var beginSection = new Regex(@"^\[");
+            var urlLine = new Regex(@"^\s+url = (\S+)\s*$", RegexOptions.IgnoreCase);
+
+            var inRemoteOriginSection = false;
+            foreach (var line in File.ReadAllLines(filename))
+            {
+                if (beginOriginSection.IsMatch(line))
+                {
+                    inRemoteOriginSection = true;
+                    continue;
+                }
+
+                if (inRemoteOriginSection)
+                {
+                    if (beginSection.IsMatch(line))
+                    {
+                        // Read through the section without finding URL line.
+                        break;
+                    }
+
+                    var match = urlLine.Match(line);
+                    if (match.Success && match.Groups.Count == 2 && match.Groups[1].Success)
+                    {
+                        return match.Groups[1].Value;
+                    }
+                }
+            }
+
+            Console.WriteLine("Unable to parse '{0}' file", filename);
+            return null;
+        }
+
+        static bool IsHttpsUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url))
+            {
+                return false;
+            }
+
+            return url.StartsWith("https://", System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool IsAccessible(string key)
+        {
+            var req = WebRequest.CreateHttp("https://github.com/aspnet/" + key);
+            req.Method = "HEAD";
+            try
+            {
+                using (req.GetResponse());
+            }
+            catch (WebException ex)
+            {
+                if (ex.Response != null &&
+                    ((HttpWebResponse)ex.Response).StatusCode == HttpStatusCode.NotFound)
+                {
+                    return false;
+                }
+
+                // Ignore any other exception. They should surface as part of git clone with well-known messages.
+            }
+            return true;
+        }
+
+        IEnumerable<string> GetAllRepos()
+        {
+            var nonDefaultRepos = new[]
+            {
+              "DNX",
+              "Coherence",
+              "Coherence-Signed",
+              "dnvm",
+            };
+
+            return Enumerable.Concat(nonDefaultRepos, repositories);
+        }
+
+        bool ShouldSkipCopyingNugetConfig(string repo)
+        {
+            var skipList = new string[]{"Coherence-Signed"};
+
+            return skipList.Any(r => r == repo);
+        }
+
+        void CloneOrUpdate(string repo)
+        {
+            var repoUrl = gitHubUriPrefix + repo + ".git";
+
+            if(Directory.Exists(repo))
+            {
+                GitPull(repoUrl, BUILD_BRANCH, repo);
+            }
+            else
+            {
+                if (useHttps &&
+                    !IsAccessible(repo))
+                {
+                    if (SKIP_NO_CREDENTIALS)
+                    {
+                        // This is used on the XPlat CI. Must return because otherwise git will wait for user
+                        // input and hang the build
+                        Log.Warn(string.Format("The repo at '{0}' is not accesible and it will not be cloned.", repoUrl));
+                        return;
+                    }
+
+                    Log.Warn(string.Format("The repo at '{0}' is not accessible. If you do not have access to this repository, skip the git prompt" +
+                                           " for credentials to skip cloning this repository. To avoid this prompt, re-clone the Universe repository over ssh.",
+                                           repoUrl));
+                }
+
+                try
+                {
+                    GitClone(repoUrl, BUILD_BRANCH);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn(string.Format("Unable to clone repository at '{0}': {1}", repoUrl, ex.Message));
+                    return;
+                }
+
+                // Configuring Git bug tracking settings hangs from time to time on Win7/2008 when running as part of the CI build
+                if (!IsTeamCity)
+                {
+                    GitConfig("bugtraq.url", "http://github.com/aspnet/" + repo + "/issues/%BUGID%", repo);
+                    GitConfig("bugtraq.logregex", @"#(\d+)", repo);
+                }
+            }
+        }
+
+        string FormatForTeamCity(string input)
+        {
+            return input.Replace("|", "||")
+                        .Replace("'", "|'")
+                        .Replace("\r", "|r")
+                        .Replace("\n", "|n")
+                        .Replace("]", "|]");
+        }
+
+        // Currently there are two packages that need to be special cased.
+        // TODO: Revisit as this is changed in the near future.
+        string ProcessExcludesForPackages(string jsonEntry, bool stable=false)
+        {
+            var newEntry = jsonEntry.Replace("Microsoft.Net.Http.Client\": \"1.0.0-*\"", "Microsoft.Net.Http.Client\": \"1.0.0-beta3\"");
+            newEntry = newEntry.Replace("Microsoft.AspNet.HttpFeature\": { \"version\": \"1.0.0-*\"", "Microsoft.AspNet.HttpFeature\": { \"version\": \"1.0.0-beta2\"");
+
+            return newEntry;
+        }
+
+        // Create a search replace expression based on branch, prerelease tag and buildNumber
+        string BuildVersionExpression(string branch, string preRelease = "", string buildNumber = "")
+        {
+            var stableBranches = new[] {"master"};
+            var builder = new StringBuilder();
+
+            // Add pre release version tag
+            if(!String.IsNullOrEmpty(preRelease))
+            {
+                builder.Append("-");
+                builder.Append(preRelease);
+            }
+
+            // If buildnumber is provided, append.
+            // This for CORE CLR packages
+            if(!String.IsNullOrEmpty(buildNumber))
+            {
+                builder.Append("-");
+                builder.Append(buildNumber);
+            }
+            else if(!stableBranches.Contains(branch))
+            {
+                builder.Append("-*");
+            }
+
+            return builder.ToString();
+        }
+
+        // Verify if this is indeed the project.json or project.lock.json under project
+        bool ShouldIncludeProjectJson(string jsonPath)
+        {
+            // Should be under src, test or samples folders
+            if(!jsonPath.StartsWith("src") && !jsonPath.StartsWith("test") && !jsonPath.StartsWith("samples"))
+            {
+                return false;
+            }
+
+            // Within the specified folders, few projects generate under build folders. They can be excluded
+            if(jsonPath.Contains("bin") || jsonPath.Contains("Debug")
+             || jsonPath.Contains("artifacts") || jsonPath.Contains("node_modules") || !jsonPath.Contains(".json"))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        static IEnumerable<string> GetRepositoriesToBuild()
+        {
+            IEnumerable<string> reposToBuild = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+                // The repos list is topologically sorted based on build order
+                "Common",
+                "Configuration",
+                "DependencyInjection",
+                "Microsoft.Data.Sqlite",
+                "EventNotification",
+                "Options",
+                "Logging",
+                "UserSecrets",
+                "DataProtection",
+                "Caching",
+                "HttpAbstractions",
+                "Testing",
+                "FileSystem",
+                "Razor",
+                "RazorTooling",
+                "Hosting",
+                "EntityFramework",
+                "Helios",
+                "WebListener",
+                "KestrelHttpServer",
+                "ServerTests",
+                "Diagnostics",
+                "Antiforgery",
+                "CORS",
+                "Security",
+                "Routing",
+                "StaticFiles",
+                "WebSockets",
+                "Localization",
+                "Session",
+                "BasicMiddleware",
+                "Proxy",
+                "Mvc",
+                "Identity",
+                "Scaffolding",
+                "SignalR-Server",
+                "SignalR-SQLServer",
+                "SignalR-Redis",
+                "BrowserLink",
+                "Entropy",
+		        "MusicStore"
+            };
+
+            var repositoryInclude = Environment.GetEnvironmentVariable("KOREBUILD_REPOSITORY_INCLUDE");
+            if (!string.IsNullOrEmpty(repositoryInclude))
+            {
+                reposToBuild = new HashSet<string>(
+                    repositoryInclude.Split(new string[] {","}, StringSplitOptions.RemoveEmptyEntries),
+                    StringComparer.OrdinalIgnoreCase);
+            }
+
+            var repositoryExclude = Environment.GetEnvironmentVariable("KOREBUILD_REPOSITORY_EXCLUDE");
+            if (!string.IsNullOrEmpty(repositoryExclude))
+            {
+                var reposToExclude = repositoryExclude.Split(new string[] {","}, StringSplitOptions.RemoveEmptyEntries);
+                reposToBuild = reposToBuild.Except(reposToExclude);
+            }
+
+            return reposToBuild.ToList();
+        }
+    }

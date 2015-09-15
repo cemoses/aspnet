@@ -1,0 +1,81 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildThisFileDirectory)..\..\Build\Config.Definitions.props" />
+  <Import Project="$(MSBuildThisFileDirectory)..\..\Build\Dnx.Common.Targets" />
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{D0E2FB09-0FEA-478A-9068-D6AA420C6DED}</ProjectGuid>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+    <Configuration Condition="'$(Configuration)'==''">Debug</Configuration>
+    <PlatformToolset>v140</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <Keyword>Win32Proj</Keyword>
+    <BuildForOneCore Condition="'$(BuildForOneCore)' == ''">False</BuildForOneCore>
+    <RootNamespace>dnx</RootNamespace>
+    <ProjectName>dnx.win32</ProjectName>
+    <ProjectName Condition="'$(BuildForOneCore)' == 'True'">dnx.onecore</ProjectName>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <Defines Condition="$(RuntimeType) == 'CORECLR_WIN'">CORECLR_WIN</Defines>
+  </PropertyGroup>
+  <PropertyGroup Label="Globals" Condition="'$(Platform)' == 'ARM'">
+    <ProjectName>dnx</ProjectName>
+    <ConfigurationType>Application</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup>
+    <OutDir>bin\$(Platform)\$(Configuration)\$(TargetFramework)\</OutDir>
+    <IntDir>bin\$(ProjectName)\$(Platform)\$(Configuration)\$(TargetFramework)\</IntDir>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(MSBuildThisFileDirectory)..\..\Build\Dnx.Native.Settings" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions Condition="'$(BuildForOneCore)' == 'True'">ONECORE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Platform)' == 'ARM'">_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <Subsystem>Console</Subsystem>
+      <ModuleDefinitionFile Condition="'$(Platform)' != 'ARM'">dnx.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemGroup>
+    <ClInclude Include="pal.h" />
+    <ClInclude Include="resource.h" />
+    <ClInclude Include="servicing.h" />
+    <ClInclude Include="stdafx.h" />
+    <ClInclude Include="targetver.h" />
+    <ClInclude Include="version.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Condition="'$(Platform)' != 'ARM'" Include="dllmain.cpp" />
+    <ClCompile Include="dnx.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="pal.win32.cpp" />
+    <ClCompile Include="servicing.cpp" />
+    <ClCompile Include="stdafx.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Resource.rc" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(Platform)' != 'ARM'">
+    <None Include="dnx.def" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\dnx.common\dnx.common.vcxproj">
+      <Project>{1fe82655-09ee-456d-82b5-4625857ff53d}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
